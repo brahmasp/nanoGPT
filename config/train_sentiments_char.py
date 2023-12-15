@@ -9,14 +9,14 @@ log_interval = 10 # don't print too too often
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False
 
-wandb_log = False # override via command line if you like
-wandb_project = 'sentiments-char'
-wandb_run_name = 'mini-gpt'
+wandb_log = True # override via command line if you like
+wandb_project = 'sentiment-analyzer'
+wandb_run_name = 'test_run'
 
 dataset = 'sentiments_char'
 gradient_accumulation_steps = 1
 batch_size = 64
-block_size = 256 # context of up to 256 previous characters
+block_size = 32 # context of up to 256 previous characters
 
 # baby GPT model :)
 n_layer = 3

@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-
+import random
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
@@ -47,7 +47,7 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+block_size = 32
 # model
 n_layer = 12
 n_head = 12
@@ -69,13 +69,17 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
-device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
+
+prefix_size = 3
+prefix_embed_size = 24
+
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
@@ -113,19 +117,63 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+prefix_train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+prefix_val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+
+sentiment_remap_dict = {
+    100: 0,
+    101: 1,
+    102: 2,
+
+}
+
+def compute_token_array(data, prefix_size=3):
+    prefix_tokens = sorted(np.unique(data))[-prefix_size:]
+    prev_token_index = 0
+    token_array = np.zeros_like(data)
+    sentiment_mask = np.zeros_like(data)
+    sentiment_idxs = {}
+    for i in range(len(data)):
+        token = data[i]
+        if token in prefix_tokens:
+            token_array[prev_token_index:i] = token
+            sentiment_idxs[token] = sentiment_idxs.get(token, []) + [i]
+            sentiment_mask[prev_token_index: i + 1]  = sentiment_remap_dict[token]
+            # sentiment_idxs.append([i, i - prev_token_index, token]) 
+            prev_token_index = i + 1
+
+    return token_array, sentiment_idxs, sentiment_mask
+
+
+train_prefix_tokens, train_sentiment_idxs, train_sentiment_masks = compute_token_array(prefix_train_data)
+val_prefix_tokens, val_sentiment_idxs, val_sentiment_masks = compute_token_array(prefix_val_data)
+
+train_mask = ~np.isin(prefix_train_data, train_prefix_tokens)
+train_data = prefix_train_data[train_mask]
+train_prefix_tokens = train_prefix_tokens[train_mask]
+train_prefix_masks = train_sentiment_masks[train_mask]
+
+val_mask = ~np.isin(prefix_val_data, val_prefix_tokens)
+val_data = prefix_val_data[val_mask]
+val_prefix_tokens = val_prefix_tokens[val_mask]
+val_prefix_masks = val_sentiment_masks[val_mask]
+
 def get_batch(split):
     data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    sentiment_masks = train_sentiment_masks if split == 'train' else val_sentiment_masks
+    
+    ix = torch.randint(len(data) - 2*block_size, (batch_size,))
+
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    sentiment_vec = torch.stack([torch.from_numpy((sentiment_masks[i:i+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     else:
         x, y = x.to(device), y.to(device)
-    return x, y
+    return x, y, sentiment_vec
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
@@ -141,8 +189,18 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+model_args = dict(
+    n_layer=n_layer, 
+    n_head=n_head, 
+    n_embd=n_embd, 
+    block_size=block_size,
+    bias=bias, 
+    vocab_size=None, 
+    dropout=dropout, 
+    prefix_size=prefix_size,
+    prefix_embed_size=prefix_embed_size
+) # start with model_args from command line
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -216,9 +274,9 @@ def estimate_loss():
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y, prefix = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, prefix=prefix)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -241,10 +299,14 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.init(entity="absdnd", 
+               project=wandb_project, 
+               name=wandb_run_name, 
+               config=config
+            )
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+X, Y, X_prefix = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
@@ -294,10 +356,10 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y, X_prefix)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        X, Y, X_prefix = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient

@@ -10,8 +10,7 @@ import requests
 import numpy as np
 import pdb
 
-# download the tiny shakespeare dataset
-input_file_path = os.path.join(os.path.dirname(__file__), 'input.txt')
+input_file_path = os.path.join(os.path.dirname(__file__), 'raw.txt')
 
 with open(input_file_path, 'r', encoding = "ISO-8859-1") as f:
     data = f.read()
@@ -66,7 +65,6 @@ meta = {
     'itos': itos,
     'stoi': stoi,
 }
-pdb.set_trace()
 with open(os.path.join(os.path.dirname(__file__), 'meta.pkl'), 'wb') as f:
     pickle.dump(meta, f)
 
