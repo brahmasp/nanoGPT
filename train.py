@@ -27,8 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import random
-from model import GPTConfig, GPT
-
+from model import GPTConfig, GPT, SentimentAnalyzer
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -69,6 +68,9 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
+prefix_size = 3
+prefix_embed_size = 24
+sentiment_interval = 100
 device = 'cpu' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
@@ -77,8 +79,6 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
-prefix_size = 3
-prefix_embed_size = 24
 
 # -----------------------------------------------------------------------------
 
@@ -145,6 +145,8 @@ def compute_token_array(data, prefix_size=3):
     return token_array, sentiment_idxs, sentiment_mask
 
 
+
+
 train_prefix_tokens, train_sentiment_idxs, train_sentiment_masks = compute_token_array(prefix_train_data)
 val_prefix_tokens, val_sentiment_idxs, val_sentiment_masks = compute_token_array(prefix_val_data)
 
@@ -178,6 +180,7 @@ def get_batch(split):
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
+best_senti_val_loss = 1e9
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -210,6 +213,12 @@ if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+    sentiment_model = SentimentAnalyzer(
+        input_dim=meta_vocab_size,
+        embedding_dim=n_embd,
+        hidden_dim=block_size//2,
+        output_dim=prefix_size,
+    )
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -250,8 +259,14 @@ model.to(device)
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-# optimizer
+# Sentiment model # 
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+senti_optimizer = torch.optim.AdamW(
+    sentiment_model.parameters(),
+    lr=learning_rate,
+    betas=(beta1, beta2),
+    weight_decay=weight_decay,
+)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
@@ -266,21 +281,36 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
+def compute_sentiment_loss(X, prefix):
+    output = sentiment_model(X)
+    gt = torch.round(prefix.float().mean(dim=-1)).long()
+    try:
+        loss = torch.nn.functional.cross_entropy(output, gt)
+    except:
+        import pdb; pdb.set_trace()
+    return loss
+
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        senti_losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y, prefix = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y, prefix=prefix)
+                sentiment_loss = compute_sentiment_loss(X, prefix)
             losses[k] = loss.item()
+            senti_losses[k] = sentiment_loss.item()
+            # loss[k + "_sentiment"] = sentiment_loss.item()
         out[split] = losses.mean()
+        out[split + "_sentiment"] = senti_losses.mean()
     model.train()
     return out
+
+# Compute Sentiment Loss using Prefix List # 
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -318,6 +348,12 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+    # Sentiment Interval # 
+    # if iter_num % sentiment_interval == 0:
+        # compute_sentiment_loss(
+            # model,
+        # )
+
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
@@ -327,6 +363,8 @@ while True:
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "train/sentiment_loss": losses['train_sentiment'],
+                "val/sentiment_loss": losses['val_sentiment'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
@@ -343,11 +381,22 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
+        if losses['val_sentiment'] < best_senti_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val_sentiment']
+            if iter_num > 0:
+                checkpoint = {
+                    "model": sentiment_model.state_dict(),
+                    "optimizer": senti_optimizer.state_dict(),
+                    "config": config,
+                }        
     if iter_num == 0 and eval_only:
         break
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
+    sentiment_loss = compute_sentiment_loss(X, X_prefix)
+    sentiment_loss.backward()
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -362,15 +411,19 @@ while True:
         X, Y, X_prefix = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
+    
+    senti_optimizer.step()
     scaler.step(optimizer)
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+    senti_optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
@@ -383,7 +436,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, senti-loss {sentiment_loss:.4f} time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
 

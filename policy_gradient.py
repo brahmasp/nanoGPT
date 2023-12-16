@@ -24,28 +24,7 @@ stoi, itos = meta['stoi'], meta['itos']
 encode = lambda s: [stoi[c] for c in s]
 decode = lambda l: ''.join([itos[i] for i in l])
 
-dataset = 'bernard_char'
-num_train_char = 10000
-block_size = 256
-batch_size = 32
-n_layer = 3
-n_head = 4
-n_embd = 128
-dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear 
-learning_rate = 6e-4 # max learning rate
-weight_decay = 0.1 # strength of weight regularization
-beta1 = 0.9 # optimizer params for Adam
-beta2 = 0.95 # optimizer params for Adam
-num_train_batches = 1000 # number of batches per epoch
-eval_interval = 20 # how often we evaluate on train/val
-wandb_log = True # log to weights & biases
-device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
-device = torch.device(device_type)
-eval_iters = 200
-model_folder = 'out_policy_grad'
-out_reward_dir = 'out_reward_model/reward_model.pt'
-save_model = True
+
 
 
 data_dir = os.path.join('data', dataset)

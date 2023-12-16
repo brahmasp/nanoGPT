@@ -77,6 +77,23 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+# Takes in an input dimension of 256  #
+# Outputs a value classification of sentiment # 
+class SentimentAnalyzer(nn.Module):
+    def __init__(self, input_dim, embedding_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(input_dim, embedding_dim)
+        self.fc = nn.Linear(embedding_dim, hidden_dim)
+        self.out = nn.Linear(hidden_dim, output_dim)
+        self.act = nn.Softmax(dim = -1)
+
+    def forward(self, text):
+        embedded = self.embedding(text)
+        hidden = self.fc(embedded)
+        o = self.out(hidden).mean(dim=1)
+        return self.act(o)
+    
+    
 class MLP(nn.Module):
 
     def __init__(self, config):
